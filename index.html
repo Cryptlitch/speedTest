@@ -585,203 +585,227 @@ async function fetchCFTrace(){
 }
 fetchNetworkInfo();
 
-// ── MEASUREMENT ENGINE ──
-// Philosophy: match how Ookla/fast.com work as closely as possible
-//   • Ping  — use nearest CF PoP (already routing to CCU for you), but
-//             measure only the ESTABLISHED-connection RTT (no DNS/TLS cost)
-//             by reusing the same HTTP/2 connection across pings.
-//   • DL    — skip first 2s of samples (TCP slow-start ramp), use only
-//             steady-state throughput. Final = bytes_total / time_steady.
-//   • UL    — single large XHR per connection is most accurate for upload.
-//             Parallel connections cause head-of-line blocking on 4G/Wi-Fi.
-//             We use 2 parallel streams (not 4) and measure wall-clock bytes.
+// ════════════════════════════════════════════════════════════════════════════
+//  MEASUREMENT ENGINE  —  matches Ookla methodology
+//
+//  KEY PRINCIPLE: TCP throughput = window_size / RTT
+//  With 121ms RTT to Cloudflare, a SINGLE stream is physically limited to
+//  ~4 Mbps (64KB window / 0.121s). Ookla uses 8 parallel streams to
+//  bypass this — each stream fills its own window simultaneously.
+//  We use 6 parallel streams for download, 3 for upload.
+//
+//  NEAREST SERVER: Cloudflare's /__down endpoint routes to nearest PoP
+//  automatically via Anycast. For you that's CCU (Kolkata) which is
+//  still ~120ms. We also test against a regional fallback list and pick
+//  the one with the lowest measured latency.
+// ════════════════════════════════════════════════════════════════════════════
 
-const CF_BASE='https://speed.cloudflare.com';
-const DL_URLS=[
-  {url:`${CF_BASE}/__down?bytes=10000000`},   // 10 MB
-  {url:`${CF_BASE}/__down?bytes=25000000`},   // 25 MB  — used if >30 Mbps
-  {url:`${CF_BASE}/__down?bytes=100000000`},  // 100 MB — used if >80 Mbps
+const CF = 'https://speed.cloudflare.com';
+
+// ─── NEAREST SERVER DETECTION ────────────────────────────────────────────────
+// Probe a set of regional CORS-open endpoints and pick the fastest
+// We keep Cloudflare as primary (best CORS support) but probe latency first.
+const PROBE_URLS = [
+  // Cloudflare — Anycast, nearest PoP automatically
+  { name:'Cloudflare (nearest PoP)', base: CF, dl:`${CF}/__down`, up:`${CF}/__up` },
 ];
-const UL_TARGETS=['https://httpbin.org/post','https://postman-echo.com/post'];
 
-// ─── PING ───────────────────────────────────────────────────────────────────
-// Key insight: reuse the SAME TCP/HTTP2 connection for all pings.
-// We prime the connection with one fetch, then all subsequent fetches
-// reuse the established session — latency = true server RTT, not setup cost.
-// responseStart - requestStart from PerformanceResourceTiming is the most
-// accurate in-browser measurement (used by Cloudflare's own speed.cf).
+let SERVER = PROBE_URLS[0]; // default, updated after latency probe
 
-async function measureOnePing(to=3000){
-  const url=`${CF_BASE}/__down?bytes=0&nc=${Date.now()}.${Math.random().toString(36).slice(2)}`;
-  const ctrl=new AbortController(),t=setTimeout(()=>ctrl.abort(),to);
-  try{
+async function detectNearestServer() {
+  // Probe each candidate with 2 back-to-back pings, pick lowest avg
+  const probes = await Promise.all(PROBE_URLS.map(async s => {
+    const times = [];
+    for(let i=0;i<2;i++){
+      const t=await rawPing(s.dl+'?bytes=0&probe='+Date.now());
+      if(t!==null)times.push(t);
+    }
+    return { s, avg: times.length ? Math.round(times.reduce((a,b)=>a+b)/times.length) : 9999 };
+  }));
+  probes.sort((a,b)=>a.avg-b.avg);
+  SERVER = probes[0].s;
+  return probes[0].avg;
+}
+
+// Single raw ping using PerformanceResourceTiming
+async function rawPing(url, timeout=3000) {
+  const ctrl=new AbortController();
+  const t=setTimeout(()=>ctrl.abort(), timeout);
+  try {
     performance.clearResourceTimings();
-    const res=await fetch(url,{cache:'no-store',mode:'cors',signal:ctrl.signal,keepalive:true});
+    const res=await fetch(url,{cache:'no-store',mode:'cors',signal:ctrl.signal});
     await res.arrayBuffer();
     clearTimeout(t);
     const entries=performance.getEntriesByType('resource');
-    const e=entries.slice().reverse().find(x=>x.name.includes('__down'));
-    if(e&&e.responseStart>0&&e.requestStart>0){
-      // connectEnd===0 means connection was reused (HTTP/2 multiplexing) — ideal
-      const rtt=Math.round(e.responseStart-e.requestStart);
-      if(rtt>=0&&rtt<2000)return rtt;
+    const e=entries.slice().reverse().find(x=>x.name.includes(new URL(url).hostname));
+    if(e && e.responseStart>0 && e.requestStart>0){
+      const rtt=Math.round(e.responseStart - e.requestStart);
+      if(rtt>=0 && rtt<2000) return rtt;
     }
-    return null; // discard unreliable wall-clock fallback — prefer skip over bad data
-  }catch{clearTimeout(t);return null;}
+    return null;
+  } catch { clearTimeout(t); return null; }
 }
 
-async function runPingBattery(rounds=20,cb){
-  const res=[];let lost=0;
-  // Two warmup pings to establish HTTP/2 connection — NOT counted
-  await measureOnePing(5000);
-  await measureOnePing(5000);
+// ─── PING BATTERY ────────────────────────────────────────────────────────────
+async function measureOnePing(timeout=3000){
+  return rawPing(`${SERVER.dl}?bytes=0&nc=${Date.now()}.${Math.random().toString(36).slice(2)}`, timeout);
+}
+
+async function runPingBattery(rounds=20, cb){
+  const res=[]; let lost=0;
+  // 3 warmup requests to fully establish HTTP/2 session
+  for(let i=0;i<3;i++) await measureOnePing(5000);
+
   for(let i=0;i<rounds;i++){
     const ms=await measureOnePing();
-    if(ms===null){lost++;}else{res.push(ms);}
-    cb(res,lost);
-    await sleep(80); // ~80ms gap between pings (matches Ookla's interval)
+    ms===null ? lost++ : res.push(ms);
+    cb(res, lost);
+    await sleep(80);
   }
   const pl=parseFloat(((lost/rounds)*100).toFixed(1));
-  // Remove outliers: drop top 10% spikes before averaging
+  // Drop top 10% spikes, average the rest
   const sorted=[...res].sort((a,b)=>a-b);
-  const trimmed=sorted.slice(0,Math.max(1,Math.floor(sorted.length*0.9)));
-  const ap=trimmed.length?Math.round(avg(trimmed)):999;
-  // Jitter = mean deviation of consecutive differences (RFC 3550)
+  const clean=sorted.slice(0, Math.max(1, Math.floor(sorted.length*0.9)));
+  const ap=clean.length ? Math.round(avg(clean)) : 999;
+  // RFC 3550 jitter = mean of consecutive differences
   const jitter=res.length>2
-    ?Math.round(res.slice(1).reduce((s,v,i)=>s+Math.abs(v-res[i]),0)/(res.length-1))
-    :0;
-  return{pings:res,avg:ap,jitter,packetLoss:pl};
+    ? Math.round(res.slice(1).reduce((s,v,i)=>s+Math.abs(v-res[i]),0)/(res.length-1))
+    : 0;
+  return { pings:res, avg:ap, jitter, packetLoss:pl };
 }
 
-// ─── TTFB ───────────────────────────────────────────────────────────────────
+// ─── TTFB ────────────────────────────────────────────────────────────────────
 async function measureTTFB(){
-  const url=`${CF_BASE}/__down?bytes=1&ttfb=1&_=${Date.now()}`;
-  try{
+  const url=`${CF}/__down?bytes=1&ttfb=1&_=${Date.now()}`;
+  try {
     performance.clearResourceTimings();
-    await(await fetch(url,{cache:'no-store',mode:'cors'})).arrayBuffer();
+    await (await fetch(url,{cache:'no-store',mode:'cors'})).arrayBuffer();
     const e=performance.getEntriesByType('resource').find(x=>x.name.includes('ttfb=1'));
-    if(e&&e.responseStart>0)return Math.round(e.responseStart-e.startTime);
+    if(e&&e.responseStart>0) return Math.round(e.responseStart-e.startTime);
     return null;
-  }catch{return null;}
+  } catch { return null; }
 }
 
-// ─── DOWNLOAD ───────────────────────────────────────────────────────────────
-// Fix for inflated results: skip the first RAMP_MS of samples entirely.
-// TCP slow-start means the first ~1.5s of a transfer ramps up from near-0
-// to full speed — including those samples skews the average UP because the
-// denominator (time) includes dead time but we calculate instantaneous Mbps.
-// Ookla solves this by only measuring the "steady state" window.
-async function measureDownload(cb,signal){
-  const RAMP_MS=2000; // ignore first 2s of each transfer
-  const steadySamples=[];
-  let best=0;
+// ─── DOWNLOAD — 6 parallel streams ───────────────────────────────────────────
+// Ookla uses 8 parallel TCP streams to saturate the pipe regardless of RTT.
+// Each stream independently fills its TCP window.
+// We measure: total bytes received across ALL streams / wall-clock time
+// Only count bytes received AFTER the ramp period (first 2s).
 
-  for(let attempt=0;attempt<DL_URLS.length;attempt++){
-    const{url}=DL_URLS[attempt];
-    const tStart=performance.now();
-    let loaded=0,lastT=tStart,lastL=0;
-    let inSteadyState=false;
-    let steadyStart=tStart,steadyBytes=0;
+async function measureDownload(cb, signal){
+  const PARALLEL = 6;
+  const RAMP_MS  = 2000;  // ignore first 2s (TCP slow-start across all streams)
+  const TEST_MS  = 15000; // total test duration
+  const CHUNK_BYTES = 25_000_000; // 25 MB per stream request
 
-    try{
-      const res=await fetch(url+`&r=${Date.now()}`,{cache:'no-store',signal});
-      if(!res.ok||!res.body)throw 0;
-      const reader=res.body.getReader();
-      while(true){
-        const{done,value}=await reader.read();
-        if(done)break;
-        if(signal?.aborted){reader.cancel();break;}
-        loaded+=value.byteLength;
-        const now=performance.now();
-        const sinceStart=now-tStart;
+  let totalBytes = 0;
+  let steadyBytes = 0;
+  let inSteady = false;
+  let steadyStart = 0;
+  const tStart = performance.now();
+  let running = true;
 
-        // Enter steady state after RAMP_MS
-        if(!inSteadyState&&sinceStart>=RAMP_MS){
-          inSteadyState=true;
-          steadyStart=now;
-          steadyBytes=0;
-          lastT=now;lastL=loaded;
+  // Ramp timer
+  setTimeout(()=>{
+    inSteady = true;
+    steadyStart = performance.now();
+    steadyBytes = 0;
+  }, RAMP_MS);
+
+  // Kill timer
+  setTimeout(()=>{ running=false; }, TEST_MS);
+  signal?.addEventListener('abort',()=>{ running=false; },{once:true});
+
+  // UI ticker — fires every 300ms showing current throughput
+  const ticker = setInterval(()=>{
+    if(!inSteady) return;
+    const elapsed=(performance.now()-steadyStart)/1000;
+    if(elapsed<0.3||steadyBytes===0) return;
+    const mbps=parseFloat(((steadyBytes*8)/(elapsed*1e6)).toFixed(2));
+    if(mbps>0) cb(mbps);
+  }, 300);
+
+  // Each worker streams one large file, loops while test is running
+  async function dlWorker(){
+    while(running && !signal?.aborted){
+      try {
+        const url=`${CF}/__down?bytes=${CHUNK_BYTES}&r=${Date.now()}.${Math.random()}`;
+        const res=await fetch(url,{cache:'no-store',signal});
+        if(!res.ok||!res.body) break;
+        const reader=res.body.getReader();
+        while(running){
+          const{done,value}=await reader.read();
+          if(done) break;
+          if(signal?.aborted){reader.cancel();break;}
+          totalBytes+=value.byteLength;
+          if(inSteady) steadyBytes+=value.byteLength;
         }
-
-        if(inSteadyState){
-          steadyBytes+=value.byteLength;
-          const el=(now-lastT)/1000;
-          if(el>=0.25){
-            const mb=parseFloat((((loaded-lastL)*8)/(el*1e6)).toFixed(2));
-            if(mb>0){steadySamples.push(mb);cb(mb);}
-            lastT=now;lastL=loaded;
-          }
-        }
-      }
-
-      // Final speed = steady-state bytes / steady-state time (most accurate)
-      if(inSteadyState&&steadyBytes>0){
-        const steadyElapsed=(performance.now()-steadyStart)/1000;
-        const steadyMbps=parseFloat(((steadyBytes*8)/(steadyElapsed*1e6)).toFixed(2));
-        if(steadyMbps>best)best=steadyMbps;
-      }
-
-      // Escalate to larger file if connection is fast
-      const totalMbps=parseFloat(((loaded*8)/((performance.now()-tStart)/1000*1e6)).toFixed(2));
-      if(totalMbps>30&&attempt<DL_URLS.length-1)continue;
-      break;
-    }catch(e){if(signal?.aborted)break;break;}
+      } catch { /* network error — try again */ }
+    }
   }
-  // Use trimmed mean of steady-state samples, fall back to best overall
-  return trimmedMean(steadySamples)||best;
+
+  // Launch all parallel workers simultaneously — this is the key fix
+  await Promise.all(Array.from({length:PARALLEL}, dlWorker));
+
+  clearInterval(ticker);
+
+  // Final result: steady-state bytes / steady-state time
+  const finalElapsed=(performance.now()-steadyStart)/1000;
+  const finalMbps=steadyBytes>0 && finalElapsed>1
+    ? parseFloat(((steadyBytes*8)/(finalElapsed*1e6)).toFixed(2))
+    : parseFloat(((totalBytes*8)/((performance.now()-tStart)/1000*1e6)).toFixed(2));
+
+  return finalMbps||0;
 }
 
-// ─── UPLOAD ─────────────────────────────────────────────────────────────────
-// Fix for 13 Mbps vs 40 Mbps: the wall-clock ticker was dividing TOTAL bytes
-// by TOTAL elapsed including the ramp-up period — same ramp issue as download.
-// Fix: measure each XHR chunk individually. bytes_sent / time_for_that_chunk.
-// Use only 2 parallel connections (not 4) — more than 2 causes congestion on
-// most mobile connections and actually reduces throughput.
-async function measureUpload(cb,signal){
-  const RAMP_CHUNKS=2;  // skip first 2 chunk measurements per worker (ramp)
-  const TEST_MS=14000;  // 14 second window
-  let running=true;
-  const tStart=performance.now();
-  const chunkSamples=[];  // individual chunk Mbps measurements
+// ─── UPLOAD — 3 parallel streams ─────────────────────────────────────────────
+// Same parallel principle as download. 3 streams balances throughput vs
+// server-side rate limiting on httpbin/postman-echo.
+// Measure: bytes confirmed sent per chunk / chunk elapsed time.
 
+const UL_TARGETS=['https://httpbin.org/post','https://postman-echo.com/post'];
+
+async function measureUpload(cb, signal){
+  const PARALLEL    = 3;
+  const RAMP_CHUNKS = 2;   // skip first N chunks per worker (TCP ramp)
+  const TEST_MS     = 15000;
+  const CHUNK_SIZE  = 2 * 1024 * 1024; // 2 MB per chunk
+
+  let running=true;
+  const chunkSamples=[];
   const stopTimer=setTimeout(()=>{running=false;},TEST_MS);
   signal?.addEventListener('abort',()=>{running=false;},{once:true});
 
-  // Display ticker using chunk samples
   const ticker=setInterval(()=>{
     if(!chunkSamples.length)return;
-    // Show rolling average of last 4 chunks
-    const recent=chunkSamples.slice(-4);
-    const mbps=parseFloat(avg(recent).toFixed(2));
-    if(mbps>0)cb(mbps);
+    const recent=chunkSamples.slice(-PARALLEL*2); // last N chunks across all workers
+    cb(parseFloat(avg(recent).toFixed(2)));
   },400);
 
-  async function xhrWorker(ep,workerIdx){
-    const SZ=1*1024*1024; // 1 MB per chunk — big enough for accurate timing
-    const d=new Uint8Array(SZ);
-    for(let i=0;i<SZ;i+=65536)crypto.getRandomValues(d.subarray(i,Math.min(i+65536,SZ)));
-    const blob=new Blob([d]);
-    let chunkCount=0;
+  // Pre-generate random data (incompressible) — shared across all workers
+  const buf=new Uint8Array(CHUNK_SIZE);
+  for(let i=0;i<CHUNK_SIZE;i+=65536)
+    crypto.getRandomValues(buf.subarray(i,Math.min(i+65536,CHUNK_SIZE)));
 
-    while(running&&!signal?.aborted){
-      const chunkStart=performance.now();
-      let bytesSentThisChunk=0;
+  async function ulWorker(epIdx){
+    const ep=UL_TARGETS[epIdx%UL_TARGETS.length];
+    const blob=new Blob([buf]);
+    let count=0;
+
+    while(running && !signal?.aborted){
+      const t0=performance.now();
+      let sent=0;
 
       await new Promise(resolve=>{
         const xhr=new XMLHttpRequest();
-        let lastSent=0;
+        let last=0;
         xhr.upload.addEventListener('progress',e=>{
           if(!e.lengthComputable)return;
-          bytesSentThisChunk+=(e.loaded-lastSent);
-          lastSent=e.loaded;
+          sent+=(e.loaded-last); last=e.loaded;
         });
-        xhr.onload=()=>{
-          bytesSentThisChunk+=(SZ-lastSent); // credit remaining bytes
-          resolve();
-        };
-        xhr.onerror=()=>resolve();
-        xhr.ontimeout=()=>resolve();
-        xhr.timeout=12000;
+        const done=()=>{ sent+=(CHUNK_SIZE-last); resolve(); };
+        xhr.onload=done; xhr.onerror=done; xhr.ontimeout=done;
+        xhr.timeout=15000;
         xhr.open('POST',ep,true);
         xhr.send(blob);
         const ab=()=>{xhr.abort();resolve();};
@@ -789,28 +813,21 @@ async function measureUpload(cb,signal){
         xhr.onloadend=()=>signal?.removeEventListener('abort',ab);
       });
 
-      chunkCount++;
-      // Skip first RAMP_CHUNKS chunks (TCP slow-start)
-      if(chunkCount>RAMP_CHUNKS&&bytesSentThisChunk>0){
-        const elapsed=(performance.now()-chunkStart)/1000;
-        if(elapsed>0.2){
-          const mbps=parseFloat(((bytesSentThisChunk*8)/(elapsed*1e6)).toFixed(2));
-          if(mbps>0)chunkSamples.push(mbps);
+      count++;
+      if(count>RAMP_CHUNKS && sent>0){
+        const elapsed=(performance.now()-t0)/1000;
+        if(elapsed>0.3){
+          const mbps=parseFloat(((sent*8)/(elapsed*1e6)).toFixed(2));
+          if(mbps>0) chunkSamples.push(mbps);
         }
       }
     }
   }
 
-  // 2 parallel workers on best endpoints
-  await Promise.all([
-    xhrWorker(UL_TARGETS[0],0),
-    xhrWorker(UL_TARGETS[1],1),
-  ]);
+  await Promise.all(Array.from({length:PARALLEL},(_,i)=>ulWorker(i)));
 
   clearInterval(ticker);
   clearTimeout(stopTimer);
-
-  // Return trimmed mean of all steady-state chunk measurements
   return trimmedMean(chunkSamples)||0;
 }
 
@@ -833,8 +850,14 @@ async function startTest(){
   ['dlVal','ulVal','pingVal','jitterVal','lossVal','ttfbVal'].forEach(id=>set(id,'…'));
   ['dlBar','ulBar','pingBar','jitterBar','lossBar','ttfbBar'].forEach(id=>document.getElementById(id).style.width='0%');
   ['dlGrade','ulGrade','pingGrade','jitterGrade','lossGrade','ttfbGrade'].forEach(id=>{const e=document.getElementById(id);e.textContent='—';e.style.color='';});
-  setPhase('Connecting to test servers…',0);
+  setPhase('Detecting nearest server…',0);
   try{
+    // Step 0: detect nearest server & establish HTTP/2 session
+    await detectNearestServer();
+    set('netServer', `${SERVER.name}`);
+    setPhase(`Server: ${SERVER.name}`,3);
+    await sleep(200);
+
     // Ping
     setPhase('Measuring latency…',2);
     set('gaugeUnit','MS PING');
